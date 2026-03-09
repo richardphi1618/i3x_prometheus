@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: i3x_adapter
+    static_configs:
+      - targets: ["adapter:9000"]

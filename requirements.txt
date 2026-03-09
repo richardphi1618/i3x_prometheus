@@ -1,0 +1,5 @@
+fastapi>=0.110.0
+uvicorn>=0.29.0
+i3x-client>=0.1.5
+prometheus-client>=0.20.0
+python-dotenv>=1.0.0
