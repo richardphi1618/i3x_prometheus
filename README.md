@@ -1,5 +1,5 @@
 > [!NOTE]
-> This was "vibe coded" in like an hour and mostly as a simple project for me to explore: coding with claude / working with the [i3x](https://www.i3x.dev/) api and sdk kit. **Do not expect much from this**. Maybe I will give this more thought with time but for now felt like something fun to buid / play with. 
+> This was "vibe coded" in like an hour and mostly as a simple project for me to explore: coding with claude / working with the [i3x](https://www.i3x.dev/) api and sdk kit. **Do not expect much from this**. Maybe I will give this more thought with time but for now felt like something fun to build / play with. 
 
 # i3X → Prometheus Adapter
 
