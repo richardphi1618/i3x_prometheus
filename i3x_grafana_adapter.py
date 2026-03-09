@@ -22,12 +22,13 @@ Configuration:
 """
 
 import json
-import logging
 import os
 import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Any
+
+from loguru import logger
 
 import i3x
 import uvicorn
@@ -77,35 +78,52 @@ def load_config() -> dict[str, Any]:
 
 CONFIG = load_config()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("i3x-adapter")
-
 # ─────────────────────────────────────────────
 # Prometheus metrics
 # ─────────────────────────────────────────────
 
 registry = CollectorRegistry()
 
-# Numeric gauges — populated at startup (after discovery or from config)
+# Numeric gauges — keyed by element_id.
 gauges: dict[str, Gauge] = {}
 
-# State gauges — created lazily for elements whose values are strings.
+# State gauges — keyed by element_id.
 # Pattern: gauge{state="running"} = 1, all other states = 0
 state_gauges: dict[str, Gauge] = {}
 _current_states: dict[str, tuple[str, str]] = {}  # element_id -> (state_value, quality)
 
 
-def ensure_gauges(subscriptions: list[dict]):
-    """Create Prometheus Gauges for any subscription not yet registered."""
-    for sub in subscriptions:
-        eid = sub["id"]
-        if eid not in gauges:
-            gauges[eid] = Gauge(
-                name=sub["label"],
-                documentation=sub.get("description", sub["label"]),
-                labelnames=["quality", "element_id"],
-                registry=registry,
-            )
+def _classify_metric_kind(schema: dict) -> str:
+    """
+    Classify an object type schema as 'numeric' or 'state'.
+
+    Rules (from i3X JSON Schema conventions):
+      - type "number" or "integer" → numeric gauge
+      - anything else              → state gauge
+        (is_composition already filtered real containers before this is called)
+    """
+    schema_type = schema.get("type", "")
+    if schema_type in ("number", "integer"):
+        return "numeric"
+    return "state"
+
+
+def _create_numeric_gauge(label: str, description: str) -> Gauge:
+    return Gauge(
+        name=label,
+        documentation=description,
+        labelnames=["quality", "element_id"],
+        registry=registry,
+    )
+
+
+def _create_state_gauge(element_id: str) -> Gauge:
+    return Gauge(
+        name=element_id.replace("-", "_") + "_status",
+        documentation=f"Active state of {element_id} (1 = current state)",
+        labelnames=["state", "quality", "element_id"],
+        registry=registry,
+    )
 
 
 adapter_info = Info("i3x_adapter", "i3X Grafana adapter metadata", registry=registry)
@@ -144,37 +162,47 @@ def parse_sync_response(raw: list[dict]) -> dict[str, dict]:
     return result
 
 
+def _set_state_gauge(element_id: str, state_label: str, quality: str):
+    """Set the active state to 1, zeroing out any previous state."""
+    sg = state_gauges[element_id]
+    prev = _current_states.get(element_id)
+    if prev is not None and prev != (state_label, quality):
+        sg.labels(state=prev[0], quality=prev[1], element_id=element_id).set(0)
+    sg.labels(state=state_label, quality=quality, element_id=element_id).set(1)
+    _current_states[element_id] = (state_label, quality)
+
+
+def _extract_state_label(raw_value) -> str:
+    """Extract a human-readable state label from a string or complex dict value."""
+    if isinstance(raw_value, str):
+        return raw_value
+    if isinstance(raw_value, dict):
+        type_obj = raw_value.get("type", {})
+        return type_obj.get("name") or raw_value.get("description") or str(raw_value)
+    return str(raw_value)
+
+
 def update_metrics(parsed: dict[str, dict]):
     """Push parsed VQT data into Prometheus gauges."""
     for element_id, vqt in parsed.items():
         raw_value = vqt["value"]
         quality = vqt["quality"]
 
-        if isinstance(raw_value, (int, float)):
-            gauge = gauges.get(element_id)
-            if gauge is not None:
-                gauge.labels(quality=quality, element_id=element_id).set(raw_value)
+        if raw_value is None:
+            logger.warning(f"No value for {element_id}, skipping")
+            continue
 
-        elif isinstance(raw_value, str):
-            # String/enum state — expose as gauge{state="<value>"} = 1 (active), 0 (inactive)
-            if element_id not in state_gauges:
-                name = element_id.replace("-", "_") + "_status"
-                state_gauges[element_id] = Gauge(
-                    name=name,
-                    documentation=f"Active state of {element_id} (1 = current state)",
-                    labelnames=["state", "quality", "element_id"],
-                    registry=registry,
-                )
-            sg = state_gauges[element_id]
-            prev = _current_states.get(element_id)
-            if prev is not None and prev != (raw_value, quality):
-                sg.labels(state=prev[0], quality=prev[1], element_id=element_id).set(0)
-            sg.labels(state=raw_value, quality=quality, element_id=element_id).set(1)
-            _current_states[element_id] = (raw_value, quality)
-            log.debug(f"Updated {element_id} state = {raw_value!r} ({quality})")
+        if element_id in gauges:
+            if isinstance(raw_value, (int, float)):
+                gauges[element_id].labels(quality=quality, element_id=element_id).set(raw_value)
+            else:
+                logger.warning(f"Expected numeric for {element_id}, got {type(raw_value).__name__}")
 
-        elif raw_value is None:
-            log.warning(f"No value for {element_id}, skipping")
+        elif element_id in state_gauges:
+            state_label = _extract_state_label(raw_value)
+            _set_state_gauge(element_id, state_label, quality)
+        else:
+            logger.warning(f"No gauge registered for {element_id}, skipping")
 
 # ─────────────────────────────────────────────
 # Background polling thread
@@ -195,49 +223,75 @@ def _run_client():
 
     try:
         client.connect()
-        log.info(f"Connected to {CONFIG['i3x_base_url']}")
+        logger.info(f"Connected to {CONFIG['i3x_base_url']}")
     except i3x.I3XError as exc:
-        log.error(f"Failed to connect to i3X: {exc}")
+        logger.error(f"Failed to connect to i3X: {exc}")
         return
 
-    # Discover or use configured subscriptions
-    subscriptions = CONFIG.get("subscriptions") or []
-    if not subscriptions:
-        log.info("No subscriptions configured — discovering objects from i3X …")
-        try:
-            objects = client.get_objects()
-        except i3x.I3XError as exc:
-            log.error(f"Failed to discover objects: {exc}")
-            client.disconnect()
-            return
-        subscriptions = [
-            {
-                "id": obj.element_id,
-                "label": obj.element_id.replace("-", "_"),
-                "description": obj.display_name,
-                "unit": "",
-            }
-            for obj in objects
-            if not obj.is_composition
-        ]
-        log.info(f"Discovered {len(subscriptions)} subscribable objects")
+    # Discover objects and classify by schema type
+    logger.info("Discovering objects from i3X …")
+    try:
+        objects = client.get_objects()
+    except i3x.I3XError as exc:
+        logger.error(f"Failed to discover objects: {exc}")
+        client.disconnect()
+        return
 
-    ensure_gauges(subscriptions)
-    element_ids = [s["id"] for s in subscriptions]
+    leaf_objects = [obj for obj in objects if not obj.is_composition]
+    logger.info(f"Discovered {len(leaf_objects)} leaf objects")
+
+    # Fetch type schemas for all leaf objects
+    unique_type_ids = list({obj.type_id for obj in leaf_objects if obj.type_id})
+    try:
+        object_types = client.query_object_types(unique_type_ids)
+    except i3x.I3XError as exc:
+        logger.error(f"Failed to query object types: {exc}")
+        client.disconnect()
+        return
+    schema_by_type_id = {ot.element_id: ot.schema for ot in object_types}
+
+    # Apply configured subscriptions filter (if set), then classify and create gauges
+    config_subs = CONFIG.get("subscriptions") or []
+    if config_subs:
+        configured_ids = {s["id"] for s in config_subs}
+        label_map = {s["id"]: s["label"] for s in config_subs}
+        desc_map = {s["id"]: s.get("description", s["label"]) for s in config_subs}
+        leaf_objects = [obj for obj in leaf_objects if obj.element_id in configured_ids]
+    else:
+        label_map = {}
+        desc_map = {}
+
+    element_ids = []
+    for obj in leaf_objects:
+        schema = schema_by_type_id.get(obj.type_id, {})
+        kind = _classify_metric_kind(schema)
+        label = label_map.get(obj.element_id, obj.element_id.replace("-", "_"))
+        description = desc_map.get(obj.element_id, obj.display_name or label)
+
+        if kind == "numeric":
+            gauges[obj.element_id] = _create_numeric_gauge(label, description)
+            element_ids.append(obj.element_id)
+        else:
+            state_gauges[obj.element_id] = _create_state_gauge(obj.element_id)
+            element_ids.append(obj.element_id)
+
+    logger.info(
+        f"Registered {len(gauges)} numeric gauge(s), {len(state_gauges)} state gauge(s)"
+    )
 
     # Create subscription using the low-level API (avoids SSE)
     try:
         sub_id = client.create_subscription()
         client.register_items(sub_id, element_ids)
         i3x_subscription = client.get_subscription(sub_id)
-        log.info(f"Subscribed to {len(element_ids)} objects (id={sub_id})")
+        logger.info(f"Subscribed to {len(element_ids)} objects (id={sub_id})")
     except i3x.I3XError as exc:
-        log.error(f"Failed to create subscription: {exc}")
+        logger.error(f"Failed to create subscription: {exc}")
         client.disconnect()
         return
 
     # Poll loop
-    log.info("Polling loop started.")
+    logger.info("Polling loop started.")
     while not _stop_event.is_set():
         try:
             raw = client.sync_subscription(sub_id)
@@ -245,27 +299,27 @@ def _run_client():
             update_metrics(parsed)
             last_sync_gauge.set(time.time())
             if parsed:
-                log.debug(f"Synced {len(parsed)} objects.")
+                logger.debug(f"Synced {len(parsed)} objects.")
             else:
-                log.info("Sync returned no data (empty response from i3X).")
+                logger.info("Sync returned no data (empty response from i3X).")
         except i3x.NotFoundError:
-            log.warning("Subscription expired, recreating …")
+            logger.warning("Subscription expired, recreating …")
             try:
                 sub_id = client.create_subscription()
                 client.register_items(sub_id, element_ids)
                 i3x_subscription = client.get_subscription(sub_id)
-                log.info(f"Subscription recreated (id={sub_id})")
+                logger.info(f"Subscription recreated (id={sub_id})")
             except i3x.I3XError as exc:
-                log.error(f"Failed to recreate subscription: {exc}")
+                logger.error(f"Failed to recreate subscription: {exc}")
         except i3x.I3XError as exc:
             _error_count += 1
             errors_gauge.set(_error_count)
-            log.error(f"i3x error during sync: {exc}")
+            logger.error(f"i3x error during sync: {exc}")
 
         _stop_event.wait(CONFIG["poll_interval_seconds"])
 
     client.disconnect()
-    log.info("i3x client disconnected.")
+    logger.info("i3x client disconnected.")
 
 
 # ─────────────────────────────────────────────
@@ -323,9 +377,15 @@ async def root():
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import logging
+
+    # Route uvicorn's standard logging through loguru
+    logging.getLogger("uvicorn").handlers = []
+    logging.getLogger("uvicorn.access").handlers = []
+
     uvicorn.run(
         "i3x_grafana_adapter:app",
         host="0.0.0.0",
         port=CONFIG["adapter_port"],
-        log_level="info",
+        log_config=None,
     )
