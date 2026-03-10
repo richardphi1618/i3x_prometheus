@@ -21,8 +21,10 @@ Configuration:
                         leave unset to auto-discover all leaf objects.
 """
 
+import base64
 import json
 import os
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -92,36 +94,103 @@ gauges: dict[str, Gauge] = {}
 state_gauges: dict[str, Gauge] = {}
 _current_states: dict[str, tuple[str, str]] = {}  # element_id -> (state_value, quality)
 
+# Composite gauges — for object elements whose every leaf property is numeric.
+# element_id -> {property_path: Gauge}
+composite_gauges: dict[str, dict[str, Gauge]] = {}
+
+
+def _sanitize_name(name: str) -> str:
+    """Convert any string to a valid Prometheus metric name segment."""
+    return re.sub(r"[^a-zA-Z0-9_]", "_", name).strip("_")
+
+
+def _readable_id(element_id: str) -> str:
+    """
+    Decode a base64 element_id and strip the leading [provider] prefix.
+    e.g. 'W2RlZmF1bHRdTW9kZWxlZC9UZXN0IFVEVCAx' → 'Modeled/Test UDT 1'
+    Falls back to the raw element_id if decoding fails.
+    """
+    try:
+        decoded = base64.b64decode(element_id + "==").decode("utf-8")
+        return re.sub(r"^\[[^\]]*\]", "", decoded)
+    except Exception:
+        return element_id
+
+
+def _all_leaves_numeric(schema: dict) -> bool:
+    """
+    Return True only when every leaf value in the schema is numeric.
+    Used to distinguish measurement UDTs (all-int/float) from state objects
+    that mix numerics with strings/enums.
+    """
+    schema_type = schema.get("type", "")
+    if schema_type in ("number", "integer"):
+        return True
+    if schema_type in ("string", "boolean", "null"):
+        return False
+    if schema_type == "object":
+        props = schema.get("properties", {})
+        return bool(props) and all(_all_leaves_numeric(p) for p in props.values())
+    return False
+
 
 def _classify_metric_kind(schema: dict) -> str:
     """
-    Classify an object type schema as 'numeric' or 'state'.
+    Classify an object type schema as 'numeric', 'composite', or 'state'.
 
-    Rules (from i3X JSON Schema conventions):
-      - type "number" or "integer" → numeric gauge
-      - anything else              → state gauge
-        (is_composition already filtered real containers before this is called)
+      - type "number" or "integer"               → numeric gauge
+      - type "object" where all leaves numeric   → composite (one gauge per leaf)
+      - anything else                            → state gauge
     """
     schema_type = schema.get("type", "")
     if schema_type in ("number", "integer"):
         return "numeric"
+    if schema_type == "object" and _all_leaves_numeric(schema):
+        return "composite"
     return "state"
+
+
+def _flatten_numeric_leaves(schema: dict, prefix: str = "") -> list[tuple[str, str]]:
+    """Walk schema properties and return [(path, json_type)] for every numeric leaf."""
+    results = []
+    schema_type = schema.get("type", "")
+    if schema_type in ("number", "integer"):
+        results.append((prefix, schema_type))
+    elif schema_type == "object":
+        for prop_name, prop_schema in schema.get("properties", {}).items():
+            child = f"{prefix}_{prop_name}" if prefix else prop_name
+            results.extend(_flatten_numeric_leaves(prop_schema, child))
+    return results
+
+
+def _flatten_dict_values(value: dict, prefix: str = "") -> list[tuple[str, Any]]:
+    """Walk a nested dict and return [(path, value)] for every leaf."""
+    results = []
+    for key, val in value.items():
+        child = f"{prefix}_{key}" if prefix else key
+        if isinstance(val, dict):
+            results.extend(_flatten_dict_values(val, child))
+        else:
+            results.append((child, val))
+    return results
 
 
 def _create_numeric_gauge(label: str, description: str) -> Gauge:
     return Gauge(
         name=label,
         documentation=description,
-        labelnames=["quality", "element_id"],
+        labelnames=["quality", "path"],
         registry=registry,
     )
 
 
 def _create_state_gauge(element_id: str) -> Gauge:
+    readable = _readable_id(element_id)
+    metric_name = _sanitize_name(readable) + "_status"
     return Gauge(
-        name=element_id.replace("-", "_") + "_status",
-        documentation=f"Active state of {element_id} (1 = current state)",
-        labelnames=["state", "quality", "element_id"],
+        name=metric_name,
+        documentation=f"Active state of {readable} (1 = current state)",
+        labelnames=["state", "quality", "path"],
         registry=registry,
     )
 
@@ -162,13 +231,13 @@ def parse_sync_response(raw: list[dict]) -> dict[str, dict]:
     return result
 
 
-def _set_state_gauge(element_id: str, state_label: str, quality: str):
+def _set_state_gauge(element_id: str, state_label: str, quality: str, readable: str):
     """Set the active state to 1, zeroing out any previous state."""
     sg = state_gauges[element_id]
     prev = _current_states.get(element_id)
     if prev is not None and prev != (state_label, quality):
-        sg.labels(state=prev[0], quality=prev[1], element_id=element_id).set(0)
-    sg.labels(state=state_label, quality=quality, element_id=element_id).set(1)
+        sg.labels(state=prev[0], quality=prev[1], path=readable).set(0)
+    sg.labels(state=state_label, quality=quality, path=readable).set(1)
     _current_states[element_id] = (state_label, quality)
 
 
@@ -192,17 +261,29 @@ def update_metrics(parsed: dict[str, dict]):
             logger.warning(f"No value for {element_id}, skipping")
             continue
 
+        readable = _readable_id(element_id)
+
         if element_id in gauges:
             if isinstance(raw_value, (int, float)):
-                gauges[element_id].labels(quality=quality, element_id=element_id).set(raw_value)
+                gauges[element_id].labels(quality=quality, path=readable).set(raw_value)
             else:
                 logger.warning(f"Expected numeric for {element_id}, got {type(raw_value).__name__}")
 
+        elif element_id in composite_gauges:
+            if isinstance(raw_value, dict):
+                sub_gauges = composite_gauges[element_id]
+                for path, val in _flatten_dict_values(raw_value):
+                    if path in sub_gauges and isinstance(val, (int, float)):
+                        sub_gauges[path].labels(quality=quality, path=readable).set(val)
+            else:
+                logger.warning(f"Expected dict for composite {element_id}, got {type(raw_value).__name__}")
+
         elif element_id in state_gauges:
             state_label = _extract_state_label(raw_value)
-            _set_state_gauge(element_id, state_label, quality)
+            _set_state_gauge(element_id, state_label, quality, readable)
+
         else:
-            logger.warning(f"No gauge registered for {element_id}, skipping")
+            logger.debug(f"No gauge registered for {element_id}, skipping")
 
 # ─────────────────────────────────────────────
 # Background polling thread
@@ -216,6 +297,14 @@ _error_count = 0
 
 def _run_client():
     """Connect, discover, subscribe, and poll — runs in a background thread."""
+    try:
+        _run_client_inner()
+    except Exception:
+        logger.exception("Unhandled exception in i3x polling thread — thread is exiting")
+
+
+def _run_client_inner():
+    """Inner implementation — separated so the outer function can catch all escaping exceptions."""
     global i3x_client, i3x_subscription, _error_count
 
     client = i3x.Client(CONFIG["i3x_base_url"], auth=CONFIG["auth"])
@@ -225,7 +314,7 @@ def _run_client():
         client.connect()
         logger.info(f"Connected to {CONFIG['i3x_base_url']}")
     except i3x.I3XError as exc:
-        logger.error(f"Failed to connect to i3X: {exc}")
+        logger.error(f"Failed to connect: {exc}")
         return
 
     # Discover objects and classify by schema type
@@ -237,10 +326,12 @@ def _run_client():
         client.disconnect()
         return
 
-    leaf_objects = [obj for obj in objects if not obj.is_composition]
+    leaf_objects = [
+        obj for obj in objects
+        if not obj.is_composition and _readable_id(obj.element_id)
+    ]
     logger.info(f"Discovered {len(leaf_objects)} leaf objects")
 
-    # Fetch type schemas for all leaf objects
     unique_type_ids = list({obj.type_id for obj in leaf_objects if obj.type_id})
     try:
         object_types = client.query_object_types(unique_type_ids)
@@ -250,7 +341,6 @@ def _run_client():
         return
     schema_by_type_id = {ot.element_id: ot.schema for ot in object_types}
 
-    # Apply configured subscriptions filter (if set), then classify and create gauges
     config_subs = CONFIG.get("subscriptions") or []
     if config_subs:
         configured_ids = {s["id"] for s in config_subs}
@@ -271,15 +361,35 @@ def _run_client():
         if kind == "numeric":
             gauges[obj.element_id] = _create_numeric_gauge(label, description)
             element_ids.append(obj.element_id)
+
+        elif kind == "composite":
+            base = _sanitize_name(obj.display_name or label)
+            leaves = _flatten_numeric_leaves(schema)
+            sub_gauges = {}
+            for path, _ in leaves:
+                sub_gauges[path] = Gauge(
+                    name=f"{base}_{path}",
+                    documentation=f"{obj.display_name} – {path}",
+                    labelnames=["quality", "path"],
+                    registry=registry,
+                )
+            composite_gauges[obj.element_id] = sub_gauges
+            element_ids.append(obj.element_id)
+            logger.info(f"Composite '{obj.display_name}': {[f'{base}_{p}' for p, _ in leaves]}")
+
         else:
             state_gauges[obj.element_id] = _create_state_gauge(obj.element_id)
             element_ids.append(obj.element_id)
 
     logger.info(
-        f"Registered {len(gauges)} numeric gauge(s), {len(state_gauges)} state gauge(s)"
+        f"Registered {len(gauges)} numeric, {len(composite_gauges)} composite, "
+        f"{len(state_gauges)} state gauge(s)"
     )
 
-    # Create subscription using the low-level API (avoids SSE)
+    # Create subscription using the low-level API
+    # Note: high-level client.subscribe() uses SSE streaming which is broken in i3x-client 0.1.5
+    # (response.stream.iter_text() was never a valid httpx public API). Using sync polling instead
+    # until the upstream fix is released.
     try:
         sub_id = client.create_subscription()
         client.register_items(sub_id, element_ids)
@@ -315,6 +425,8 @@ def _run_client():
             _error_count += 1
             errors_gauge.set(_error_count)
             logger.error(f"i3x error during sync: {exc}")
+        except Exception:
+            logger.exception("Unexpected error in poll loop — continuing")
 
         _stop_event.wait(CONFIG["poll_interval_seconds"])
 
